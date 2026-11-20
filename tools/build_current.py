@@ -27,6 +27,7 @@ PATCHES = (
 	'ysf-dn-narrow.patch',
 	'unified-tx-splash.patch',
 	'aprs-dual-focus.patch',
+	'p25-audio-fifo.patch',	# RadioFoundry 845f9ad5 (#660): HR_C7000 speaker FIFO starvation, P25 clipping
 )
 
 
