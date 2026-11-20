@@ -1,0 +1,512 @@
+diff --git a/core/aprs/afsk.c b/core/aprs/afsk.c
+index 14f090e..146a2b8 100644
+--- a/core/aprs/afsk.c
++++ b/core/aprs/afsk.c
+@@ -223,3 +223,13 @@ uint32_t afsk_demod_aborts(const afsk_demod_t *d)
+ 	}
+ 	return n;
+ }
++
++bool afsk_demod_dcd(const afsk_demod_t *d)
++{
++	for (int p = 0; p < AFSK_PATHS; p++) {
++		if (d->path[p].hdlc.dcd) {
++			return true;
++		}
++	}
++	return false;
++}
+diff --git a/core/aprs/afsk.h b/core/aprs/afsk.h
+index 621763a..5be11cd 100644
+--- a/core/aprs/afsk.h
++++ b/core/aprs/afsk.h
+@@ -75,5 +75,7 @@ void afsk_demod(afsk_demod_t *d, const int16_t *s, size_t n);
+ // The HDLC decoders' frames with a bad FCS and aborts, summed over the paths
+ uint32_t afsk_demod_fcs_errors(const afsk_demod_t *d);
+ uint32_t afsk_demod_aborts(const afsk_demod_t *d);
++// A packet is coming in on either path: its preamble's flags were heard, and no abort or idle since
++bool afsk_demod_dcd(const afsk_demod_t *d);
+ 
+ #endif
+diff --git a/core/aprs/aprs.h b/core/aprs/aprs.h
+index fff7c66..bcbd0cd 100644
+--- a/core/aprs/aprs.h
++++ b/core/aprs/aprs.h
+@@ -30,6 +30,7 @@
+ #define APRS_STATUS_MAX		40
+ #define APRS_STATIONS		12
+ #define APRS_MESSAGES		4
++#define APRS_RX_BUSY_MAX_MS	2500u		// the longest a packet in progress holds the receiver (a long one is ~2 s)
+ #define APRS_MSG_TRIES		3
+ 
+ typedef enum {
+@@ -241,6 +242,12 @@ bool aprs_rf_pending(void);
+ bool aprs_can_receive(void);
+ // The receive path is running (the receiver must stay awake: no battery saving)
+ bool aprs_rx_listening(void);
++// A packet is coming in on the receive path (its preamble's flags heard), for at most APRS_RX_BUSY_MAX_MS
++bool aprs_rx_busy(uint32_t now_ms);
++// A packet was decoded in the last ms milliseconds
++bool aprs_rx_heard_within(uint32_t now_ms, uint32_t ms);
++// The frequency the receive path decodes on, 0 when receiving is off or the radio can't
++uint32_t aprs_rx_freq(void);
+ // A status packet (">text")
+ bool aprs_send_status(const char *text);
+ // A message with acks and retries; false when one is still waiting or the text is unusable
+@@ -270,6 +277,9 @@ static inline uint8_t aprs_tx_power(uint8_t current) { return current; }
+ static inline bool aprs_rf_pending(void) { return false; }
+ static inline bool aprs_can_receive(void) { return false; }
+ static inline bool aprs_rx_listening(void) { return false; }
++static inline bool aprs_rx_busy(uint32_t now_ms) { (void)now_ms; return false; }
++static inline bool aprs_rx_heard_within(uint32_t now_ms, uint32_t ms) { (void)now_ms; (void)ms; return false; }
++static inline uint32_t aprs_rx_freq(void) { return 0u; }
+ static inline bool aprs_send_status(const char *text) { (void)text; return false; }
+ static inline bool aprs_send_message(const char *to, const char *text) { (void)to; (void)text; return false; }
+ static inline bool aprs_send_message_opts(const char *to, const char *text, uint8_t flags)
+diff --git a/core/aprs/aprs_ax25.c b/core/aprs/aprs_ax25.c
+index b72f466..0cb2b75 100644
+--- a/core/aprs/aprs_ax25.c
++++ b/core/aprs/aprs_ax25.c
+@@ -820,6 +820,8 @@ void aprs_rx_frame(const uint8_t *frame, size_t n, uint32_t now_ms)
+ static void demod_frame(const uint8_t *frame, size_t n, void *ctx)
+ {
+ 	(void)ctx;
++	aprs_s.rx_frame_seen = true;
++	aprs_s.rx_frame_ms = aprs_s.now;
+ 	aprs_rx_frame(frame, n, aprs_s.now);
+ }
+ 
+@@ -882,6 +884,7 @@ void aprs_ax25_rx_service(const aprs_radio_t *r, uint32_t now_ms)
+ 			audio_mux_aprs_rx(false);
+ 		}
+ 		aprs_s.rx_running = false;
++		aprs_s.rx_dcd = false;
+ 	}
+ 	if (!want) {
+ 		aprs_s.rx_retry_wait = false;	// a refusal's wait is for the try it followed, not a later one
+@@ -892,6 +895,11 @@ void aprs_ax25_rx_service(const aprs_radio_t *r, uint32_t now_ms)
+ 		while ((k = own ? h->rx_read(aprs_s.rxbuf, n) : (uint16_t)audio_mux_aprs_read(aprs_s.rxbuf, n)) != 0) {
+ 			aprs_rx_audio(aprs_s.rxbuf, k, now_ms);
+ 		}
++		bool dcd = afsk_demod_dcd(&aprs_s.demod);
++		if (dcd && !aprs_s.rx_dcd) {
++			aprs_s.rx_dcd_ms = now_ms;
++		}
++		aprs_s.rx_dcd = dcd;
+ 	}
+ }
+ #endif
+@@ -917,6 +925,37 @@ void aprs_rx_stats(aprs_rx_stats_t *out)
+ }
+ #endif
+ 
++bool aprs_rx_busy(uint32_t now_ms)
++{
++#if CONFIG_APRS_RX
++	// Capped: a stuck decision (a steady tone that happens to make flags) holds nothing for long
++	return aprs_s.rx_running && aprs_s.rx_dcd && now_ms - aprs_s.rx_dcd_ms < APRS_RX_BUSY_MAX_MS;
++#else
++	(void)now_ms;
++	return false;
++#endif
++}
++
++bool aprs_rx_heard_within(uint32_t now_ms, uint32_t ms)
++{
++#if CONFIG_APRS_RX
++	return aprs_s.rx_frame_seen && now_ms - aprs_s.rx_frame_ms < ms;
++#else
++	(void)now_ms;
++	(void)ms;
++	return false;
++#endif
++}
++
++uint32_t aprs_rx_freq(void)
++{
++#if CONFIG_APRS_RX
++	return aprs_s.cfg.rx_on && aprs_can_receive() ? aprs_cfg_freq(&aprs_s.cfg) : 0u;
++#else
++	return 0u;
++#endif
++}
++
+ bool aprs_rx_listening(void)
+ {
+ #if CONFIG_APRS_RX
+diff --git a/core/aprs/aprs_int.h b/core/aprs/aprs_int.h
+index 1fdb5ed..ec8d46d 100644
+--- a/core/aprs/aprs_int.h
++++ b/core/aprs/aprs_int.h
+@@ -81,6 +81,10 @@ typedef struct {
+ 	uint16_t rx_peak;
+ 	uint32_t rx_start_fails, rx_retry_ms;	// starts the board refused; the next try (RX_RETRY_MS later)
+ 	bool rx_retry_wait;			// the last start was refused: wait for rx_retry_ms
++	bool rx_dcd;				// a packet is coming in (afsk_demod_dcd), since rx_dcd_ms
++	uint32_t rx_dcd_ms;
++	bool rx_frame_seen;			// a frame was decoded, the last at rx_frame_ms (radio task)
++	uint32_t rx_frame_ms;
+ 	int16_t rxbuf[160];
+ 	char gate[AX25_TNC2_MAX + 20];
+ #endif
+diff --git a/core/aprs/hdlc.c b/core/aprs/hdlc.c
+index d579cdf..7b4f209 100644
+--- a/core/aprs/hdlc.c
++++ b/core/aprs/hdlc.c
+@@ -94,6 +94,8 @@ static void append(hdlc_dec_t *d, bool bit)
+ {
+ 	if (d->nbits >= HDLC_BUF_MAX * 8u) {
+ 		d->in_frame = false;	// too long: wait for the next flag
++		d->dcd = false;
++		d->flag_run = 0;
+ 		d->nbits = 0;
+ 		return;
+ 	}
+@@ -118,6 +120,8 @@ size_t hdlc_dec_bit(hdlc_dec_t *d, bool mark)
+ 				d->aborts++;
+ 			}
+ 			d->in_frame = false;
++			d->dcd = false;		// a packet ends in an abort or the idle channel's noise
++			d->flag_run = 0;
+ 			d->nbits = 0;
+ 			return 0;
+ 		}
+@@ -127,6 +131,18 @@ size_t hdlc_dec_bit(hdlc_dec_t *d, bool mark)
+ 		return 0;
+ 	}
+ 	if (d->ones == 6) {			// 0111111 0: a flag
++		// Right after another flag (its seven bits the only ones since): the preamble's run, which says a packet
++		// is coming in long before its frame can be checked
++		if (d->in_frame && d->nbits == 7u) {
++			if (d->flag_run < 255u) {
++				d->flag_run++;
++			}
++		} else {
++			d->flag_run = 1;
++		}
++		if (d->flag_run >= HDLC_DCD_FLAGS) {
++			d->dcd = true;
++		}
+ 		if (d->in_frame && d->nbits >= 7u) {
+ 			uint32_t n = d->nbits - 7u;	// the flag's first seven bits went in
+ 			if ((n & 7u) == 0 && n / 8u >= HDLC_FRAME_MIN) {
+diff --git a/core/aprs/hdlc.h b/core/aprs/hdlc.h
+index 769bb88..5ff0b1b 100644
+--- a/core/aprs/hdlc.h
++++ b/core/aprs/hdlc.h
+@@ -15,6 +15,7 @@
+ #define HDLC_FLAG		0x7Eu
+ #define HDLC_FRAME_MIN		(2u * AX25_ADDR_BYTES + 2u + 2u)	// two addresses, control, PID, FCS
+ #define HDLC_BUF_MAX		(AX25_FRAME_MAX + 2u)			// a frame and its FCS
++#define HDLC_DCD_FLAGS		3u	// flags back to back that say a packet is coming in (noise makes one now and then)
+ 
+ // Tone sequence bits: bit i of the buffer is byte i / 8, bit i % 8 (LSB first)
+ static inline bool hdlc_tone_bit(const uint8_t *tones, uint32_t i)
+@@ -42,6 +43,8 @@ typedef struct {
+ 	uint8_t last;		// the previous tone (NRZI)
+ 	uint8_t ones;
+ 	bool in_frame;		// a flag was seen: bits are collected
++	bool dcd;		// a packet is coming in: HDLC_DCD_FLAGS flags back to back, until an abort or idle
++	uint8_t flag_run;	// flags back to back (each eight bits after the last)
+ 	uint32_t nbits;
+ 	uint8_t buf[HDLC_BUF_MAX];
+ 	uint32_t frames, fcs_errors, aborts;	// counters
+diff --git a/core/radio/radio.h b/core/radio/radio.h
+index 0ce7823..a76142a 100644
+--- a/core/radio/radio.h
++++ b/core/radio/radio.h
+@@ -104,6 +104,10 @@ typedef struct {
+ // scan dwell after each dwell back on the signal's
+ #define RADIO_DUAL_DELAY_MS	1000u
+ #define RADIO_DUAL_DELAY_MAX_MS	10000u
++// Dual watch with one side on the APRS receive frequency (radio_sm.c dual_aprs_side): that side listens this many times
++// the scan dwell, holds while a packet comes in, and after a packet waits this long for a digipeater's copy of it
++#define RADIO_DUAL_APRS_DWELL_X		3u
++#define RADIO_DUAL_APRS_LINGER_MS	3000u
+ 
+ typedef enum { RADIO_BATT_OK, RADIO_BATT_LOW, RADIO_BATT_CRITICAL } radio_batt_t;	// = batt_level_t
+ 
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 169a61d..58c9e4b 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -3987,6 +3987,48 @@ static bool dual_running(const radio_sm_t *sm)
+ 	return sm->scan.kind == SCAN_DUAL;
+ }
+ 
++#if CONFIG_DUAL_WATCH && CONFIG_APRS_RX
++// Dual watch on one receiver with the receiver now on the side APRS decodes (FM, the APRS receive frequency). That side
++// listens longer (dual_dwell), holds while a packet comes in, and after a signal waits RADIO_DUAL_APRS_LINGER_MS for a
++// digipeater's copy (dual_delay): one receiver can't hear both, so the packets get the larger share
++static bool dual_aprs_side(const radio_sm_t *sm)
++{
++	uint32_t hz = aprs_rx_freq();
++	return dual_running(sm) && hz != 0 && sm->view.ch.mode == RADIO_MODE_FM && sm->view.ch.rx_hz == hz;
++}
++
++// On the APRS side with a packet coming in (its preamble heard): stay for it
++static bool dual_aprs_packet(const radio_sm_t *sm, uint32_t now_ms)
++{
++	return dual_aprs_side(sm) && aprs_rx_busy(now_ms);
++}
++#else
++#define dual_aprs_side(sm) ((void)(sm), false)
++#define dual_aprs_packet(sm, now_ms) ((void)(sm), (void)(now_ms), false)
++#endif
++
++#if CONFIG_DUAL_WATCH
++// The listen per stop on the tuned side: the scan dwell, times RADIO_DUAL_APRS_DWELL_X on the APRS side
++static uint16_t dual_dwell(const radio_sm_t *sm)
++{
++	uint32_t d = sm->set.scan_dwell_ms < SCAN_SETTLE_MS ? SCAN_SETTLE_MS : sm->set.scan_dwell_ms;
++	if (dual_aprs_side(sm)) {
++		d *= RADIO_DUAL_APRS_DWELL_X;
++	}
++	return (uint16_t)(d > 0xFFFFu ? 0xFFFFu : d);
++}
++
++// The wait after a signal on the tuned side: the setting, at least RADIO_DUAL_APRS_LINGER_MS on the APRS side
++static uint16_t dual_delay(const radio_sm_t *sm)
++{
++	uint32_t d = sm->set.dual_delay_ms;
++	if (dual_aprs_side(sm) && d < RADIO_DUAL_APRS_LINGER_MS) {
++		d = RADIO_DUAL_APRS_LINGER_MS;
++	}
++	return (uint16_t)(d > 0xFFFFu ? 0xFFFFu : d);
++}
++#endif
++
+ static void dual_busy_set(radio_sm_t *sm, uint8_t busy)
+ {
+ 	if (sm->view.dual_busy != busy) {
+@@ -4615,14 +4657,19 @@ static void dual_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms
+ static bool dual_wait_service(radio_sm_t *sm, const radio_status_t *st, uint32_t now_ms)
+ {
+ 	scan_t *sc = &sm->scan;
+-	uint32_t dwell = sc->cfg.dwell_ms;
+-	sc->cfg.delay_ms = sm->set.dual_delay_ms;	// a new setting applies at once
++	uint32_t dwell = dual_dwell(sm);	// the tuned side's: a look at the APRS side is longer
++	sc->cfg.delay_ms = dual_delay(sm);	// a new setting applies at once
+ 	if (sm->dual_peek) {
+ 		uint32_t since = now_ms - sc->tuned_ms;
+ 		if (since >= SCAN_SETTLE_MS && carrier_heard(sm, st->noise)) {
+ 			sm->dual_peek_heard = true;
+ 		}
+-		if (since < dwell) {
++		// A look at the APRS side stays while a packet comes in (aprs_rx_busy is capped), so it's decoded whole
++		bool packet = dual_aprs_packet(sm, now_ms);
++		if (packet) {
++			sm->dual_peek_heard = true;
++		}
++		if (since < dwell || packet) {
+ 			return true;
+ 		}
+ 		uint8_t bit = (uint8_t)(1u << sm->dual_at);
+@@ -4736,6 +4783,14 @@ static void scan_service(radio_sm_t *sm, const radio_status_t *st, uint32_t now_
+ 	{
+ 		active = sm->view.state == RS_RX && (sm->view.squelch != 0 || carrier);
+ 	}
++#if CONFIG_DUAL_WATCH
++	if (sc->kind == SCAN_DUAL) {
++		sc->cfg.dwell_ms = dual_dwell(sm);
++		sc->cfg.delay_ms = dual_delay(sm);
++		// A packet coming in on the APRS side holds it, weak enough not to open the squelch included
++		active = active || dual_aprs_packet(sm, now_ms);
++	}
++#endif
+ 	sc->cfg.probe_ms = dmr ? RADIO_SCAN_DMR_PROBE_MS : air ? RADIO_SCAN_AIR_PROBE_MS :
+ 			   tone_needed(sm) ? RADIO_SCAN_FM_PROBE_MS : 0;
+ 	sc->cfg.sync_ms = dmr ? RADIO_SCAN_DMR_SYNC_MS : air ? RADIO_SCAN_AIR_SYNC_MS : 0;
+diff --git a/docs/user/13-aprs.md b/docs/user/13-aprs.md
+index 624ecef..fcdd0e7 100644
+--- a/docs/user/13-aprs.md
++++ b/docs/user/13-aprs.md
+@@ -110,6 +110,10 @@ through a nearby iGate. They appear under the sender's callsign, and the acknowl
+ - On a radio that decodes only what opens the squelch ([Radio reference](23-radios.md)), a packet must be strong enough to open it. Keep the squelch at its usual level, not tight.
+ - Battery saving pauses while the radio listens for APRS: a sleeping receiver misses packets.
+ - Receiving is on by default. Turn it off with `tools/rfoundry_debug.py aprs set rx 0` (FM only).
++- In [dual watch](12-scan.md#dual-watch) with one channel on the APRS frequency, the radio favors that channel: it
++  listens there three times as long, stays there while a packet comes in (from its first flags, even one too weak to
++  open the squelch, for at most 2.5 s), and after a packet stays about 3 s for a digipeater's copy, with short looks at
++  the other channel. The radio has one receiver, so calls on the other channel are more likely to be missed.
+ 
+ On a DMR channel, a DMR APRS position another radio sends (some makes send it as an NMEA position) also goes into
+ **Stations heard**, whoever it is addressed to: usually the APRS gateway, as on FM every station heard is listed. It
+diff --git a/tests/host/aprsRadioTest.c b/tests/host/aprsRadioTest.c
+index 96657ec..7919554 100644
+--- a/tests/host/aprsRadioTest.c
++++ b/tests/host/aprsRadioTest.c
+@@ -1774,6 +1774,83 @@ static void test_rx_stream(void)
+ 	CHECK(sm.view.state == RS_IDLE);
+ 	fake_tap.caps = 0;
+ }
++#if CONFIG_DUAL_WATCH
++// Dual watch on one receiver with B on the APRS frequency: B gets RADIO_DUAL_APRS_DWELL_X times A's listen, a packet
++// coming in holds B until it is decoded (weak, the squelch shut, and longer than any dwell), and after it B waits
++// RADIO_DUAL_APRS_LINGER_MS for a digipeater's copy, looking at A now and then
++static void test_dual_watch_aprs_rx(void)
++{
++	fake_tap.caps = AUDIO_TAP_FM_RX;
++	memset(&pcm, 0, sizeof(pcm));
++	reset();
++	zone.count = 2;
++	zone.channels[1] = 2;
++	chan2.rx_hz = chan2.tx_hz = APRS_HZ;
++	settings_init();
++	radio_sm_init(&sm, now);
++	radio_req_t watch = { RREQ_SCAN, RSCAN_DUAL, 1 };
++	radio_sm_request(&sm, &watch, now);
++	CHECK(sm.scan.kind == SCAN_DUAL);
++	uint32_t on_aprs = 0, on_a = 0;
++	for (int i = 0; i < 400; i++) {
++		run(RADIO_POLL_MS);
++		on_aprs += hw.rx_hz == APRS_HZ;
++		on_a += hw.rx_hz == CH_HZ;
++	}
++	CHECK(on_a > 0 && on_aprs >= 2u * on_a && on_aprs <= 4u * on_a);
++	// A packet: 450 ms of flags (a long TX delay), the frame, a short tail; well over B's dwell
++	static uint8_t tones[512];
++	static int16_t audio[40000];
++	const char *line = "Q1ABC-9>APRS,WIDE2-1:!4903.50N/07201.75W-Heard in dual watch";
++	ax25_frame_t f;
++	uint8_t frame[AX25_FRAME_MAX];
++	CHECK(ax25_from_tnc2(line, strlen(line), &f));
++	f.dst.h = true;
++	size_t n = ax25_encode(&f, frame, sizeof(frame));
++	hdlc_enc_t e;
++	hdlc_enc_init(&e, tones, sizeof(tones));
++	CHECK(hdlc_enc_flags(&e, 68) && hdlc_enc_frame(&e, frame, n) && hdlc_enc_flags(&e, 3));
++	afsk_mod_t m;
++	afsk_mod_init(&m, 8000);
++	memset(audio, 0, sizeof(audio));
++	size_t k = afsk_mod(&m, tones, e.nbits, 8000, audio, sizeof(audio) / sizeof(audio[0]) - 1600);
++	CHECK(k > 8000u * 3u / 4u);	// longer than B's 450 ms dwell
++	// Wait for the watch to come to B, then the packet starts
++	for (int i = 0; i < 200 && hw.rx_hz == APRS_HZ; i++) {
++		run(RADIO_POLL_MS);
++	}
++	for (int i = 0; i < 200 && hw.rx_hz != APRS_HZ; i++) {
++		run(RADIO_POLL_MS);
++	}
++	CHECK(hw.rx_hz == APRS_HZ && aprs_station_count() == 0);
++	bool left = false;
++	for (size_t i = 0; i + AUDIO_BLOCK_SAMPLES <= k + 1600; i += AUDIO_BLOCK_SAMPLES) {
++		feed(audio + i);
++		left = left || hw.rx_hz != APRS_HZ;
++		if (aprs_station_count() != 0) {
++			break;
++		}
++	}
++	CHECK(!left);
++	aprs_station_t st;
++	CHECK(aprs_station_count() == 1 && aprs_station(0, &st) && strcmp(st.call, "Q1ABC-9") == 0);
++	// After it: the wait for a digipeater's copy, on B with looks at A, then the watch goes on
++	uint32_t steps = sm.scan.steps;
++	on_aprs = on_a = 0;
++	for (uint32_t t = 0; t < RADIO_DUAL_APRS_LINGER_MS - 500u; t += RADIO_POLL_MS) {
++		run(RADIO_POLL_MS);
++		on_aprs += hw.rx_hz == APRS_HZ;
++		on_a += hw.rx_hz == CH_HZ;
++	}
++	CHECK(sm.scan.kind == SCAN_DUAL && sm.scan.phase == SCAN_PH_RESUME);
++	CHECK(on_a > 0 && on_aprs > 2u * on_a);
++	run(2000);
++	CHECK(sm.scan.kind == SCAN_DUAL && sm.scan.steps > steps);
++	req(RREQ_SCAN, RSCAN_STOP);
++	fake_tap.caps = 0;
++}
++#endif
++
+ // A board with its own receive path and no transmit one (tx_start NULL): its audio reaches the
+ // demodulator at its own rate, nothing is sent on RF and the transmitter is never keyed for APRS
+ static struct {
+@@ -1925,6 +2002,9 @@ int main(void)
+ #if CONFIG_APRS_RX
+ 	test_stations_digi_igate();
+ 	test_rx_stream();
++#if CONFIG_DUAL_WATCH
++	test_dual_watch_aprs_rx();
++#endif
+ 	test_rx_board_only();
+ 	test_station_lookup();
+ 	test_station_range();
+diff --git a/tests/host/aprsTest.c b/tests/host/aprsTest.c
+index 90fb67e..6b92a1a 100644
+--- a/tests/host/aprsTest.c
++++ b/tests/host/aprsTest.c
+@@ -290,6 +290,67 @@ static void test_afsk(void)
+ 	CHECK(!afsk_demod_init(&d, 6000, NULL, NULL), "rate too low");
+ }
+ 
++// Packet detect (DCD): on by the preamble's fourth flag, long before the frame can be checked; held through the frame;
++// off after the carrier goes (an idle tone is seven 1s, an abort); random tones essentially never raise it
++static void test_dcd(void)
++{
++	static uint8_t frame[AX25_FRAME_MAX], tones[1024];
++	size_t n = make_frame("Q1ABC-9>APZRDF,WIDE1-1,WIDE2-1:=4903.50N/07201.75W>DCD test", frame, sizeof(frame));
++	hdlc_enc_t e;
++	hdlc_enc_init(&e, tones, sizeof(tones));
++	hdlc_enc_flags(&e, 20);
++	uint32_t pre = e.nbits;
++	hdlc_enc_frame(&e, frame, n);
++	hdlc_enc_flags(&e, 2);
++	hdlc_dec_t d;
++	hdlc_dec_init(&d);
++	bool early = false, by_third = false, through = true, got = false;
++	for (uint32_t i = 0; i < e.nbits; i++) {
++		if (hdlc_dec_bit(&d, hdlc_tone_bit(tones, i))) {
++			got = true;
++		}
++		if (i < 16u && d.dcd) {
++			early = true;
++		}
++		if (i == 4u * 8u) {
++			by_third = d.dcd;	// the first flag only primes the decoder (NRZI): the next three make the run
++		}
++		if (i >= 4u * 8u && !d.dcd) {
++			through = false;
++		}
++	}
++	(void)pre;
++	CHECK(!early, "dcd before two flags");
++	CHECK(by_third, "dcd by the fourth flag (27 ms)");
++	CHECK(through && got, "dcd through the frame (got %d)", got);
++	uint8_t last = (uint8_t)hdlc_tone_bit(tones, e.nbits - 1u);
++	for (int i = 0; i < 8; i++) {
++		hdlc_dec_bit(&d, last != 0);	// the carrier gone: one tone, no changes
++	}
++	CHECK(!d.dcd, "dcd off after idle");
++	// random tones: dcd stays down
++	hdlc_dec_init(&d);
++	uint32_t r = 12345u, on = 0, total = 200000u;
++	for (uint32_t i = 0; i < total; i++) {
++		r = r * 1103515245u + 12345u;
++		hdlc_dec_bit(&d, ((r >> 16) & 1u) != 0);
++		on += d.dcd;
++	}
++	CHECK(on == 0, "random tones: dcd on %u of %u bits", on, total);
++	// through the demodulator: on during the preamble's audio, before any frame is delivered
++	static int16_t pcm[200000];
++	afsk_mod_t m;
++	afsk_mod_init(&m, 8000);
++	size_t k = afsk_mod(&m, tones, pre, 16384, pcm, sizeof(pcm) / sizeof(pcm[0]));
++	afsk_demod_t ad;
++	CHECK(afsk_demod_init(&ad, 8000, NULL, NULL), "demod init");
++	afsk_demod(&ad, pcm, k);
++	CHECK(afsk_demod_dcd(&ad) && ad.frames == 0, "afsk dcd on the preamble alone (frames %u)", ad.frames);
++	static int16_t quiet[4000];
++	afsk_demod(&ad, quiet, sizeof(quiet) / sizeof(quiet[0]));
++	CHECK(!afsk_demod_dcd(&ad), "afsk dcd off in silence");
++}
++
+ // --- APRS formats ---
+ 
+ static void test_position_build(void)
+@@ -1475,6 +1536,7 @@ int main(int argc, char **argv)
+ 	test_fcs();
+ 	test_addresses();
+ 	test_hdlc();
++	test_dcd();
+ 	test_afsk();
+ 	test_position_build();
+ 	test_position_parse();

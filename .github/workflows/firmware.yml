@@ -71,7 +71,8 @@ jobs:
           T=build/current/tests/host
           tests="voiceCipherTest dmrAesTest dmrPrivacyTest dmrCallTest dmrCallTestAes hrc7000DmrTest p25Test p25EngineTest p25EngineTestAes p25VoiceTest
             nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest radioCoreTestYsf
-            radioCoreTestP25Nxdn radioCoreTestAirInterop codeplugEditTest codeplugTagTest settingsTest uiFlowTest"
+            radioCoreTestP25Nxdn radioCoreTestAirInterop codeplugEditTest codeplugTagTest settingsTest uiFlowTest
+            aprsTest aprsRadioTest"
           make -C "$T" -j4 $tests
           for t in $tests; do
             (cd "$T" && ./"$t")
