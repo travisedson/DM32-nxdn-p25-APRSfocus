@@ -10,6 +10,7 @@ after upstream's own by `tools/build_current.py`; every push to `main` builds a 
 |---|---|---|
 | `aprs-dual-focus.patch` | Dual watch with one side on the APRS frequency: that side listens 3x as long, holds while a packet comes in (HDLC flag detect, even below squelch, max 2.5 s), and stays ~3 s after a packet for a digipeater's copy. Tests in `aprsTest` / `aprsRadioTest`. | Works: packets decoded on the watched side (heard via Fremont Peak). Voice on the other side is missed more often. |
 | `dual-back-ab.patch` | Dual watch on Home: **Back** switches A/B (the DM-32UV has no A/B key); **holding Back** stops the watch. From a menu, held Back still only goes Home. | Works. |
+| `dual-arrows-zone.patch` | Dual watch: **Left / Right** (P1 / P2) step the selected channel's zone, as they do on the normal Home, in place of selecting A / B (Back does that now). | Pending |
 | `aprs-rx-release.patch` | Bug fix (upstream behavior): tuning off 144.390 onto a P25/NXDN/YSF channel, APRS receive still held the HR_C7000's FM audio interrupt, so the digital engine refused to start (`dmr_glue.c` `air_take`) and nothing retried it until the next retune. PTT then failed with "NO TX / Release PTT, try again", in dual watch and in single-channel mode after it, until a power cycle. APRS now releases the audio before the radio retunes. Test in `aprsRadioTest`. | Pending |
 
 ## Upstream backport
