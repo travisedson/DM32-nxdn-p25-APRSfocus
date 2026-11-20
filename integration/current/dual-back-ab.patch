@@ -1,0 +1,216 @@
+diff --git a/core/ui/ui_app.c b/core/ui/ui_app.c
+index 55cdbed..1b6d846 100644
+--- a/core/ui/ui_app.c
++++ b/core/ui/ui_app.c
+@@ -2250,6 +2250,13 @@ void ui_app_key(const input_event_t *ev)
+ #endif
+ 	// Long BACK = Home from anywhere; long CONTEXT = the talk target picker (P3; as the keycap and the AnyTone radios)
+ 	if (ev->action == ACT_BACK && ev->gesture == GESTURE_LONG) {
++#if CONFIG_DUAL_WATCH
++		// Already on Home: holding Back stops dual watch (a press switches A/B, ui_dual_back)
++		if (sp == 0 && ui_st.dual.on) {
++			ui_dual_stop();
++			return;
++		}
++#endif
+ 		ui_go_home();
+ 		return;
+ 	}
+diff --git a/core/ui/ui_dual.c b/core/ui/ui_dual.c
+index 795932f..74b59aa 100644
+--- a/core/ui/ui_dual.c
++++ b/core/ui/ui_dual.c
+@@ -18,7 +18,6 @@
+ #include "codeplug/codeplug_modes.h"
+ 
+ #define START_GRACE_MS	500	// the radio view may still show no watch this soon after asking for one
+-#define BACK_AGAIN_MS	2000	// Back on Home, then Back again within this: the watch stops
+ #define TALK_BACK_MS	10000	// talk back: PTT stays on the other channel this long after its call or our reply
+ #define PICK_ZONES	0xFFFFu	// SCR_DUAL_ZONE's "zone" for its own list of zones
+ 
+@@ -29,7 +28,6 @@ static uint32_t started_ms;
+ static bool was_tx;		// the radio transmitted since the last tick (today's core ends the watch then)
+ static uint16_t pick_zone;	// the zone SCR_DUAL_PICK lists
+ static char caller_buf[48];
+-static uint32_t back_ms;	// Back pressed once on Home (0: not lately)
+ static uint32_t cp_serial;	// the codeplug the panes were found in
+ static bool resume;		// power on: the watch comes back if it ran at power off (UI_DUAL_ON)
+ static ui_dual_ref_t chan[2];	// a pane's channel before it became the VFO: the VFO key goes back to it
+@@ -71,7 +69,6 @@ void ui_dual_reset(void)
+ 	a_known = false;
+ 	was_tx = false;
+ 	started_ms = 0;
+-	back_ms = 0;
+ 	resume = true;
+ 	memset(snap, 0, sizeof snap);
+ 	memset(chan_ok, 0, sizeof chan_ok);
+@@ -433,7 +430,6 @@ static void watch_on(ui_dual_t *d)
+ 	pane_fill(0);
+ 	pane_fill(1);
+ 	cp_serial = codeplug_serial();
+-	back_ms = 0;
+ 	state_save();
+ }
+ 
+@@ -533,19 +529,11 @@ void ui_dual_stop(void)
+ 	stop(true);
+ }
+ 
+-// Back on Home with nothing else to clear: the first press says how to stop the watch, a second one soon after stops it.
+-// Back is pressed without much thought; one press must not end it (docs/ux/dual-watch.md)
++// Back on Home with nothing else to clear: the other channel, as the A/B key. Holding Back on Home stops the watch
++// (ui_app.c, long BACK), so a stray press only moves PTT, which the toast and the panes show
+ void ui_dual_back(void)
+ {
+-	if (back_ms != 0 && ui_st.now_ms - back_ms < BACK_AGAIN_MS) {
+-		back_ms = 0;
+-		ui_dual_stop();
+-		return;
+-	}
+-	back_ms = ui_st.now_ms != 0 ? ui_st.now_ms : 1;
+-	ui_toast(TR(DUAL_TOAST_BACK_AGAIN_STOPS, TEXT_ALT_OPEN "Press Back again to stop dual watch"
+-		TEXT_ALT_NEXT "Back again: stop watch"
+-		    TEXT_ALT_CLOSE));
++	ui_dual_select(!dual()->sel);
+ }
+ 
+ void ui_dual_select(uint8_t pane)
+diff --git a/core/ui/ui_nav.h b/core/ui/ui_nav.h
+index 3452254..3797692 100644
+--- a/core/ui/ui_nav.h
++++ b/core/ui/ui_nav.h
+@@ -168,7 +168,7 @@ void ui_dual_key(void);				// the Dual watch key: on (the last B, or the picker)
+ bool ui_dual_home_key(const input_event_t *ev);	// Home's keys while it runs (true: used)
+ bool ui_dual_tick(const radio_view_t *v, uint32_t now);	// true: redraw
+ const radio_view_t *ui_dual_view(const radio_view_t *v);	// the view with the selected channel's settings
+-void ui_dual_back(void);			// Back on Home with nothing to clear: twice stops the watch
++void ui_dual_back(void);			// Back on Home with nothing to clear: the other channel (held: stop)
+ bool ui_dual_vfo_key(void);			// the VFO key: the selected channel to / from the VFO (false: off)
+ #endif
+ 
+diff --git a/docs/user/12-scan.md b/docs/user/12-scan.md
+index 3c65428..f165d30 100644
+--- a/docs/user/12-scan.md
++++ b/docs/user/12-scan.md
+@@ -174,8 +174,8 @@ the same, and the knob still steps the channel.
+ 
+ ### Stop it
+ 
+-Press **Back** twice on Home. The first press says "Press Back again to stop dual watch", so a stray press doesn't stop
+-it. If you entered a frequency or changed a setting for now, **Back** clears that first. The radio stays on the
++Hold **Back** on Home. (A short press of **Back** switches between A and B, as the **A/B** key does; held from a menu,
++**Back** only goes to Home.) If you entered a frequency or changed a setting for now, a press of **Back** clears that first. The radio stays on the
+ selected channel ("Dual watch off: on B"). These stop it too: **\***, **7**; holding the **A/B** key; **#**, **5**; and a side
+ key set to **Dual watch**. Starting a scan (**OK**, **6**, **1**, or the **Scan** key) stops it, staying on the selected
+ channel. Nothing else stops it. If the radio can't go on with a channel (it was deleted, for example), Home says where
+@@ -194,7 +194,8 @@ the radio is: "Dual watch off: on COUNTY DMR".
+ | **Monitor** (held) | Opens the squelch on the selected channel. Dual watch waits there until you let go |
+ | **Dual watch** key (Settings > Keys), hold the **A/B** key | Starts (with the last B) and stops |
+ | **VFO** | The selected channel to the VFO, and back |
+-| **Back**, twice | Stops, staying on the selected channel |
++| **Back** | The other channel (after clearing what Back clears on Home) |
++| **Back**, held on Home | Stops, staying on the selected channel |
+ 
+ Starting dual watch stops a zone scan. With **Large text** on (Settings > Display) Home shows one line per channel, the selected one
+ marked with an arrow.
+diff --git a/docs/ux/dual-watch.md b/docs/ux/dual-watch.md
+index 152420b..fd56b72 100644
+--- a/docs/ux/dual-watch.md
++++ b/docs/ux/dual-watch.md
+@@ -37,7 +37,8 @@ or the VFO: dual watch is two frequencies, not the two timeslots of one DMR freq
+ | Hold **SK2** (every radio with an SK2; the DB25-D PRO's tone key) | The same: on with the last B / off |
+ | **A/B** key (DM-1801 Pro's A/B key and the DM-1701's SK2 on a press; a side key function elsewhere) | On: selects the other channel. Off: "Turn on dual watch first" ("Dual watch is off" where that doesn't fit); it never starts it |
+ | **Dual watch** key (DM-1801 Pro's A/B key held; a side key function elsewhere) | On (last B, or the default B) / off |
+-| **Back** twice on Home (within 2 s) | Off, staying on the selected channel. Back first clears what it clears on the normal Home (VFO entry, a banner, the reply target, hear all, changes for now); then the first press says "Press Back again to stop dual watch" |
++| **Back** on Home | The other channel, as the A/B key. Back first clears what it clears on the normal Home (VFO entry, a banner, the reply target, hear all, changes for now) |
++| **Back** held on Home | Off, staying on the selected channel. Held from a menu, Back goes to Home and the watch goes on |
+ | Tools › Scan, the **Scan** key function | A zone scan (the band in the VFO) in its place: dual watch stops on the selected channel, then the scan starts |
+ | **#** **3** while it runs | Another B (**Change B**, the picker) |
+ 
+@@ -143,7 +144,7 @@ Every screen in every class is in the gallery (`docs/ux/screens/*/home_dual*.png
+ | **VFO** key | The selected channel becomes its own VFO ("A: VFO"); again, back to the channel it was ("Back to channels"). Each channel has its own VFO: with the other channel on one, this one gets the second |
+ | Copy to VFO | The selected channel is copied into its own VFO, which becomes the selected channel. With the other channel on a VFO, the copy goes to the second; the other's frequency doesn't change |
+ | Find, Channels, Zones | A channel picked there becomes the selected channel; the other channel picked selects it |
+-| **Back**, twice | Stops, staying on the selected channel (section 2) |
++| **Back** / **Back** held | The other channel / stops, staying on the selected channel (section 2) |
+ 
+ <img src="screens/160x120i5/dual_actions.png" width="200" alt="Dual watch actions">
+ 
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index b789868..863ab7d 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -215,18 +215,20 @@ static const flow_t flows[] = {
+ 	// Dual watch (docs/ux/dual-watch.md): on in a few presses, PTT on the selected channel, the other one press away
+ 	{ "11 dual watch: start, B the next channel", "", "quick 7", "dual=1 sel=A pos=3 bpos=4 screen=home", 2, false },
+ 	{ "11 dual watch: start, then B by number", "", "quick 7 ctx 3 5 ok", "dual=1 sel=A pos=3 bpos=5 screen=home", 6, false },
+-	{ "11 dual watch: again with the last B", "quick 7 ctx 3 5 ok back back", "quick 7", "dual=1 sel=A", 2, false },
++	{ "11 dual watch: again with the last B", "quick 7 ctx 3 5 ok long:back", "quick 7", "dual=1 sel=A", 2, false },
+ 	{ "11 dual watch: B in another zone", "", "quick 7 ctx 1 zone+", "dual=1 sel=B bzone=1 screen=home", 5, false },
+ 	{ "11 dual watch: B on the VFO", "", "quick 7 ctx 1 vfokey", "dual=1 bvfo=1 sel=B", 5, false },
+ 	{ "11 dual watch: talk on B from #", "quick 7 ctx 3 5 ok", "ctx 1", "dual=1 sel=B uipos=5", 2, false },
+ 	{ "11 dual watch: the A/B key", "quick 7 ctx 3 5 ok", "abkey", "dual=1 sel=B", 1, false },
+ 	{ "11 dual watch: PTT keeps it on", "quick 7 ctx 3 5 ok ctx 1", "pttdown wait:1000 pttup wait:1000", "dual=1 sel=B pos=5", 2, false },
+ 	{ "11 dual watch: Up moves the selected", "quick 7 ctx 3 5 ok", "up", "dual=1 sel=A pos=4", 1, false },
+-	{ "11 dual watch: stop stays on B", "quick 7 ctx 3 5 ok ctx 1", "back back", "dual=0 pos=5", 2, false },
+-	// One Back press says how to stop it; it goes on. A second one later is a first press again
+-	{ "11 dual watch: one Back keeps it", "quick 7 ctx 3 5 ok", "back", "dual=1 toast=Press_Back_again", 1, false },
+-	{ "11 dual watch: Back, later Back", "quick 7 ctx 3 5 ok", "back wait:2500 back", "dual=1 toast=Press_Back_again", 2,
++	{ "11 dual watch: stop stays on B", "quick 7 ctx 3 5 ok ctx 1", "long:back", "dual=0 pos=5", 2, false },
++	// Back switches A and B, as the A/B key; holding it stops the watch (on Home only: from a menu it goes Home)
++	{ "11 dual watch: Back switches to B", "quick 7 ctx 3 5 ok", "back", "dual=1 sel=B toast=Talking_on_B", 1, false },
++	{ "11 dual watch: Back again is back on A", "quick 7 ctx 3 5 ok", "back back", "dual=1 sel=A toast=Talking_on_A", 2,
+ 	  false },
++	{ "11 dual watch: long Back stops it", "quick 7 ctx 3 5 ok", "long:back", "dual=0 pos=3", 1, false },
++	{ "11 dual watch: long Back in a menu goes Home", "quick 7 ctx 3 5 ok ok", "long:back", "dual=1 sel=A", 1, false },
+ 	// Back clears the selected channel's changes first, then asks
+ 	{ "11 dual watch: Back undoes changes first", "quick 7 ctx 3 5 ok quick 2 back", "back", "dual=1 temporary=0 toast=Changes_undone",
+ 	  1, false },
+@@ -238,9 +240,9 @@ static const flow_t flows[] = {
+ 	  "rxa:9991234,91,g wait:300 rxb:9997777,3100,g wait:300 rxaend wait:300", "dual=1 rx=B calls=1 last=A", 0, false },
+ 	{ "11 dual watch, two receivers: talk on B", "receivers:2 quick 7 ctx 3 5 ok rxb:9997777,3100,g wait:300 rxbend",
+ 	  "ctx 1", "dual=1 sel=B last=B uipos=5", 2, false },
+-	{ "11 dual watch: long SK2", "quick 7 ctx 3 5 ok back back", "long:user2", "dual=1 sel=A bpos=5", 1, false },
++	{ "11 dual watch: long SK2", "quick 7 ctx 3 5 ok long:back", "long:user2", "dual=1 sel=A bpos=5", 1, false },
+ 	{ "11 dual watch: Tools > Scan, a zone scan instead", "quick 7 ctx 3 5 ok", "ok 6 1", "dual=0 scanning=1", 3, false },
+-	{ "11 dual watch: the last B after power off", "quick 7 ctx 3 5 ok back back reboot", "quick 7", "dual=1 sel=A bpos=5",
++	{ "11 dual watch: the last B after power off", "quick 7 ctx 3 5 ok long:back reboot", "quick 7", "dual=1 sel=A bpos=5",
+ 	  2, false },
+ 	// Settings > Advanced > Hardware (last row): OK steps a choice without storing ("*"), holding OK stores it
+ 	{ "S hardware options open", "hwopt", "ok 7 up ok up ok", "screen=hwopt shows=Not_set", 6, false },
+@@ -302,13 +304,13 @@ static const flow_t flows[] = {
+ 	{ "11 dual watch: digits on B the VFO, receiver on A", "quick 7 ctx 1 vfokey wait:3000 tune:a", "1 4",
+ 	  "dual=1 sel=B bvfo=1 entry=14", 2, false },
+ 	// Stopped with B selected, the radio stays on B: the next start keeps the pair (A the channel it is on)
+-	{ "11 dual watch: again after a stop on B", "quick 7 ctx 1 back back", "quick 7", "dual=1 sel=A apos=4 bpos=3", 2,
++	{ "11 dual watch: again after a stop on B", "quick 7 ctx 1 long:back", "quick 7", "dual=1 sel=A apos=4 bpos=3", 2,
+ 	  false },
+-	{ "11 dual watch: again after a stop on B and power off", "quick 7 ctx 1 back back reboot", "quick 7",
++	{ "11 dual watch: again after a stop on B and power off", "quick 7 ctx 1 long:back reboot", "quick 7",
+ 	  "dual=1 sel=A apos=4 bpos=3", 2, false },
+-	{ "11 dual watch: again on the last B's channel", "quick 7 back back up", "quick 7", "dual=1 sel=A apos=4 bpos=3", 2,
++	{ "11 dual watch: again on the last B's channel", "quick 7 long:back up", "quick 7", "dual=1 sel=A apos=4 bpos=3", 2,
+ 	  false },
+-	{ "11 dual watch key on and off", "quick 7 ctx 3 5 ok back back", "dualkey", "dual=1", 1, false },
++	{ "11 dual watch key on and off", "quick 7 ctx 3 5 ok long:back", "dualkey", "dual=1", 1, false },
+ 	// Changes and requests act on the selected channel wherever the receiver is, and stay with it over hops
+ 	{ "11 dual watch: power goes to the selected", "quick 7 ctx 3 5 ok tune:b", "quick 2 back", "dual=1 sel=A pos=3 temporary=1",
+ 	  3, false },
+@@ -373,7 +375,7 @@ static const flow_t flows[] = {
+ 	  false },
+ 	{ "11 dual watch: back with B selected", "quick 7 ctx 3 5 ok ctx 1 reboot wait:1000", "", "dual=1 sel=B apos=3 bpos=5",
+ 	  0, false },
+-	{ "11 dual watch: off stays off", "quick 7 ctx 3 5 ok back back reboot wait:1000", "", "dual=0", 0, false },
++	{ "11 dual watch: off stays off", "quick 7 ctx 3 5 ok long:back reboot wait:1000", "", "dual=0", 0, false },
+ 	// The VFO key and Copy to VFO act on the selected channel
+ 	{ "11 dual watch: VFO key", "quick 7 ctx 3 5 ok", "vfokey", "dual=1 sel=A avfo=1 bpos=5", 1, false },
+ 	{ "11 dual watch: VFO key back", "quick 7 ctx 3 5 ok vfokey", "vfokey", "dual=1 sel=A avfo=0 apos=3 bpos=5", 1, false },
+@@ -1107,7 +1109,7 @@ static const flow_t flows_k[] = {
+ 	// selected channel
+ 	{ "11 dual watch: SK2 pressed is A/B", "quick 7 ctx 3 5 ok", "sk2", "dual=1 sel=B", 1, false },
+ 		{ "11 dual watch: SK2 pressed with the watch off", "", "sk2", "dual=0 toast=Turn_on_dual_watch_first", 1, false },
+-		{ "11 dual watch: SK2 held starts it", "quick 7 ctx 3 5 ok back back", "long:sk2", "dual=1 sel=A bpos=5", 1, false },
++		{ "11 dual watch: SK2 held starts it", "quick 7 ctx 3 5 ok long:back", "long:sk2", "dual=1 sel=A bpos=5", 1, false },
+ 		{ "11 dual watch: SK2 held stops it", "quick 7 ctx 3 5 ok", "long:sk2", "dual=0", 1, false },
+ 		{ "11 dual watch: P2 moves the selected", "quick 7 ctx 3 5 ok", "user4", "dual=1 azone=1", 1, false },
+ 		{ "11 dual watch: P1 moves the selected", "quick 7 ctx 3 5 ok", "user1", "dual=1 azone=2", 1, false },

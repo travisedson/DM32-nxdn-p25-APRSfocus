@@ -28,6 +28,7 @@ PATCHES = (
 	'unified-tx-splash.patch',
 	'aprs-dual-focus.patch',
 	'p25-audio-fifo.patch',	# RadioFoundry 845f9ad5 (#660): HR_C7000 speaker FIFO starvation, P25 clipping
+	'dual-back-ab.patch',	# dual watch: Back switches A/B, held Back stops
 )
 
 
