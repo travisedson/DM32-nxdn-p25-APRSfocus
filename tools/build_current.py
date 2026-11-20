@@ -28,6 +28,7 @@ PATCHES = (
 	'unified-tx-splash.patch',
 	'aprs-dual-focus.patch',
 	'dual-back-ab.patch',	# dual watch: Back switches A/B, held Back stops
+	'aprs-rx-release.patch',	# APRS lets go of FM audio before a retune: P25 engine start (NO TX)
 )
 
 

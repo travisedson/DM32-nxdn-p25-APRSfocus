@@ -1,0 +1,166 @@
+diff --git a/core/aprs/aprs.h b/core/aprs/aprs.h
+index bcbd0cd..fe45f80 100644
+--- a/core/aprs/aprs.h
++++ b/core/aprs/aprs.h
+@@ -242,6 +242,8 @@ bool aprs_rf_pending(void);
+ bool aprs_can_receive(void);
+ // The receive path is running (the receiver must stay awake: no battery saving)
+ bool aprs_rx_listening(void);
++// Stop the receive path at once (radio task): before tuning away from the APRS frequency (aprs_ax25.c)
++void aprs_rx_release(void);
+ // A packet is coming in on the receive path (its preamble's flags heard), for at most APRS_RX_BUSY_MAX_MS
+ bool aprs_rx_busy(uint32_t now_ms);
+ // A packet was decoded in the last ms milliseconds
+@@ -277,6 +279,7 @@ static inline uint8_t aprs_tx_power(uint8_t current) { return current; }
+ static inline bool aprs_rf_pending(void) { return false; }
+ static inline bool aprs_can_receive(void) { return false; }
+ static inline bool aprs_rx_listening(void) { return false; }
++static inline void aprs_rx_release(void) {}
+ static inline bool aprs_rx_busy(uint32_t now_ms) { (void)now_ms; return false; }
+ static inline bool aprs_rx_heard_within(uint32_t now_ms, uint32_t ms) { (void)now_ms; (void)ms; return false; }
+ static inline uint32_t aprs_rx_freq(void) { return 0u; }
+diff --git a/core/aprs/aprs_ax25.c b/core/aprs/aprs_ax25.c
+index 0cb2b75..3348415 100644
+--- a/core/aprs/aprs_ax25.c
++++ b/core/aprs/aprs_ax25.c
+@@ -854,6 +854,25 @@ static bool rx_by_stream(void)
+ // try routes the receiver and back
+ #define RX_RETRY_MS	1000u
+ 
++// Stop the receive path now (radio task). The radio core calls it before it tunes away from the APRS frequency: the
++// path holds the board's FM receive audio (on the HR_C7000 the copy interrupt), which a digital mode's engine needs
++// to start, and the service below would only let go of it later in the same poll, after that start had failed
++void aprs_rx_release(void)
++{
++	if (!aprs_s.rx_running) {
++		return;
++	}
++	if (rx_by_board()) {
++		if (board.afsk->rx_stop != NULL) {
++			board.afsk->rx_stop();
++		}
++	} else {
++		audio_mux_aprs_rx(false);
++	}
++	aprs_s.rx_running = false;
++	aprs_s.rx_dcd = false;
++}
++
+ // The receive path: on while receiving FM with the setting on (radio task, outside the lock)
+ void aprs_ax25_rx_service(const aprs_radio_t *r, uint32_t now_ms)
+ {
+@@ -876,15 +895,7 @@ void aprs_ax25_rx_service(const aprs_radio_t *r, uint32_t now_ms)
+ 			audio_mux_aprs_rx(true);
+ 		}
+ 	} else if (!want && aprs_s.rx_running) {
+-		if (own) {
+-			if (h->rx_stop != NULL) {
+-				h->rx_stop();
+-			}
+-		} else {
+-			audio_mux_aprs_rx(false);
+-		}
+-		aprs_s.rx_running = false;
+-		aprs_s.rx_dcd = false;
++		aprs_rx_release();
+ 	}
+ 	if (!want) {
+ 		aprs_s.rx_retry_wait = false;	// a refusal's wait is for the try it followed, not a later one
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 58c9e4b..75569aa 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -751,6 +751,14 @@ static void tune(radio_sm_t *sm, uint32_t now_ms)
+ 	cw_cancel(sm);		// the repeater's ID: the board is set up for the channel below
+ #endif
+ 	end_reception(sm, now_ms);
++#if CONFIG_APRS_RX
++	// Off the APRS frequency (or out of FM): APRS lets go of the FM receive audio before the board changes mode. A
++	// P25, NXDN or YSF engine can't start while it holds it, and nothing retries the start until the next tune: from
++	// dual watch's APRS side that left the channel with no engine, and PTT refused ("NO TX") until a power cycle
++	if (aprs_rx_listening() && !(sm->view.ch.mode == RADIO_MODE_FM && sm->view.ch.rx_hz == aprs_rx_freq())) {
++		aprs_rx_release();
++	}
++#endif
+ 	if (radio_listen_band(sm->view.ch.rx_hz)) {
+ 		// AM or broadcast there, whatever the channel says; the VFO stays FM when it leaves the band. The channel's
+ 		// own mode follows, so FM there is not a temporary change (dual watch brings a pane back already FM)
+diff --git a/tests/host/aprsRadioTest.c b/tests/host/aprsRadioTest.c
+index 7919554..c172e78 100644
+--- a/tests/host/aprsRadioTest.c
++++ b/tests/host/aprsRadioTest.c
+@@ -61,10 +61,18 @@ static int nframes;
+ 
+ static void r_init(void) {}
+ static void r_set_mode(radio_mode_t m) { (void)m; }
++// Tunes off the APRS frequency with APRS receive still holding the FM audio: on the HR_C7000 a P25, NXDN or YSF
++// engine can't start then (dmr_glue.c air_take), so this must stay 0
++static int retune_while_aprs;
+ static bool r_rx(uint32_t hz, radio_bw_t bw, const subtone_t *t)
+ {
+ 	(void)bw;
+ 	(void)t;
++#if CONFIG_APRS_RX
++	if (hz != APRS_HZ && aprs_rx_listening()) {
++		retune_while_aprs++;
++	}
++#endif
+ 	hw.rx_hz = hz;
+ 	return true;
+ }
+@@ -1774,6 +1782,31 @@ static void test_rx_stream(void)
+ 	CHECK(sm.view.state == RS_IDLE);
+ 	fake_tap.caps = 0;
+ }
++// From a channel on the APRS frequency to another: the receive path lets go of the FM audio before the board is
++// tuned (a P25 channel's engine needs it to start), not later in the poll
++static void test_rx_release_on_retune(void)
++{
++	fake_tap.caps = AUDIO_TAP_FM_RX;
++	memset(&pcm, 0, sizeof(pcm));
++	reset();
++	retune_while_aprs = 0;
++	zone.count = 2;
++	zone.channels[1] = 2;
++	chan.rx_hz = chan.tx_hz = APRS_HZ;
++	settings_init();
++	radio_sm_init(&sm, now);
++	run(200);
++	CHECK(aprs_rx_listening() && hw.rx_hz == APRS_HZ);
++	req(RREQ_CH_STEP, 1);
++	CHECK(hw.rx_hz == CH2_HZ && !aprs_rx_listening() && retune_while_aprs == 0);
++	run(200);
++	CHECK(!aprs_rx_listening());
++	req(RREQ_CH_STEP, -1);	// back: it listens again
++	run(200);
++	CHECK(hw.rx_hz == APRS_HZ && aprs_rx_listening());
++	fake_tap.caps = 0;
++}
++
+ #if CONFIG_DUAL_WATCH
+ // Dual watch on one receiver with B on the APRS frequency: B gets RADIO_DUAL_APRS_DWELL_X times A's listen, a packet
+ // coming in holds B until it is decoded (weak, the squelch shut, and longer than any dwell), and after it B waits
+@@ -1783,6 +1816,7 @@ static void test_dual_watch_aprs_rx(void)
+ 	fake_tap.caps = AUDIO_TAP_FM_RX;
+ 	memset(&pcm, 0, sizeof(pcm));
+ 	reset();
++	retune_while_aprs = 0;
+ 	zone.count = 2;
+ 	zone.channels[1] = 2;
+ 	chan2.rx_hz = chan2.tx_hz = APRS_HZ;
+@@ -1798,6 +1832,7 @@ static void test_dual_watch_aprs_rx(void)
+ 		on_a += hw.rx_hz == CH_HZ;
+ 	}
+ 	CHECK(on_a > 0 && on_aprs >= 2u * on_a && on_aprs <= 4u * on_a);
++	CHECK(pcm.starts > 3 && retune_while_aprs == 0);	// APRS let go before every hop off its frequency
+ 	// A packet: 450 ms of flags (a long TX delay), the frame, a short tail; well over B's dwell
+ 	static uint8_t tones[512];
+ 	static int16_t audio[40000];
+@@ -2002,6 +2037,7 @@ int main(void)
+ #if CONFIG_APRS_RX
+ 	test_stations_digi_igate();
+ 	test_rx_stream();
++	test_rx_release_on_retune();
+ #if CONFIG_DUAL_WATCH
+ 	test_dual_watch_aprs_rx();
+ #endif
