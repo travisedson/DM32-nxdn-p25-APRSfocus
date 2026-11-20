@@ -1,0 +1,344 @@
+diff --git a/core/aprs/aprs.c b/core/aprs/aprs.c
+index 78b95ea..cb8d684 100644
+--- a/core/aprs/aprs.c
++++ b/core/aprs/aprs.c
+@@ -62,6 +62,7 @@ static void cfg_from_settings(const settings_t *s, aprs_cfg_t *c)
+ 	c->messaging = (f2 & SETTINGS_APRS2_MESSAGING) != 0;
+ 	c->dmr_udt = (f2 & SETTINGS_APRS2_DMR_UDT) != 0;
+ 	c->to_is = (f2 & SETTINGS_APRS2_TO_IS) != 0;
++	c->mute = (f2 & SETTINGS_APRS2_MUTE) != 0;
+ 	c->region = s->aprs_region < APRS_REGION_COUNT ? s->aprs_region : APRS_REGION_NA;
+ 	c->ssid = s->aprs_ssid <= 15 ? s->aprs_ssid : APRS_SSID_DEFAULT;
+ 	c->freq_hz = s->aprs_freq_hz;
+@@ -97,6 +98,7 @@ static void cfg_to_settings(const aprs_cfg_t *c, settings_t *s)
+ 	s->aprs_flags2 = (uint8_t)((c->igate ? SETTINGS_APRS2_IGATE : 0) | (c->igate_tx ? SETTINGS_APRS2_IGATE_TX : 0) |
+ 				   (c->messaging ? SETTINGS_APRS2_MESSAGING : 0) |
+ 				   (c->dmr_udt ? SETTINGS_APRS2_DMR_UDT : 0) | (c->to_is ? SETTINGS_APRS2_TO_IS : 0) |
++				   (c->mute ? SETTINGS_APRS2_MUTE : 0) |
+ 				   (s->aprs_flags2 & SETTINGS_APRS2_DMR_GPS));
+ 	s->aprs_region = c->region;
+ 	s->aprs_ssid = c->ssid;
+diff --git a/core/aprs/aprs.h b/core/aprs/aprs.h
+index fe45f80..ac987dc 100644
+--- a/core/aprs/aprs.h
++++ b/core/aprs/aprs.h
+@@ -71,6 +71,7 @@ typedef struct {
+ 	bool igate;		// RF -> APRS-IS
+ 	bool igate_tx;		// APRS-IS -> RF
+ 	uint8_t digi;		// aprs_digi_mode_t
++	bool mute;		// the speaker stays off on the APRS frequency in FM; decoding goes on, Monitor plays it
+ } aprs_cfg_t;	// where our position comes from and its ambiguity: the position service's settings (position.h)
+ 
+ void aprs_cfg_default(aprs_cfg_t *c);
+@@ -244,6 +245,8 @@ bool aprs_can_receive(void);
+ bool aprs_rx_listening(void);
+ // Stop the receive path at once (radio task): before tuning away from the APRS frequency (aprs_ax25.c)
+ void aprs_rx_release(void);
++// The APRS frequency while its audio is muted (aprs_cfg_t mute), else 0 (radio task)
++uint32_t aprs_mute_hz(void);
+ // A packet is coming in on the receive path (its preamble's flags heard), for at most APRS_RX_BUSY_MAX_MS
+ bool aprs_rx_busy(uint32_t now_ms);
+ // A packet was decoded in the last ms milliseconds
+@@ -280,6 +283,7 @@ static inline bool aprs_rf_pending(void) { return false; }
+ static inline bool aprs_can_receive(void) { return false; }
+ static inline bool aprs_rx_listening(void) { return false; }
+ static inline void aprs_rx_release(void) {}
++static inline uint32_t aprs_mute_hz(void) { return 0u; }
+ static inline bool aprs_rx_busy(uint32_t now_ms) { (void)now_ms; return false; }
+ static inline bool aprs_rx_heard_within(uint32_t now_ms, uint32_t ms) { (void)now_ms; (void)ms; return false; }
+ static inline uint32_t aprs_rx_freq(void) { return 0u; }
+diff --git a/core/aprs/aprs_ax25.c b/core/aprs/aprs_ax25.c
+index 3348415..6994330 100644
+--- a/core/aprs/aprs_ax25.c
++++ b/core/aprs/aprs_ax25.c
+@@ -958,6 +958,11 @@ bool aprs_rx_heard_within(uint32_t now_ms, uint32_t ms)
+ #endif
+ }
+ 
++uint32_t aprs_mute_hz(void)
++{
++	return aprs_s.cfg.mute ? aprs_cfg_freq(&aprs_s.cfg) : 0u;
++}
++
+ uint32_t aprs_rx_freq(void)
+ {
+ #if CONFIG_APRS_RX
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 75569aa..6f299b2 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -640,9 +640,17 @@ static void outputs(radio_sm_t *sm)
+ 		board.bcast->audio((open || bcast_play) && bcast);
+ 	}
+ #endif
+-	if (sm->audio_out != (int8_t)(open && !bcast)) {
+-		sm->audio_out = (int8_t)(open && !bcast);
+-		board.radio->audio(open && !bcast);
++	bool spk = open && !bcast;
++#if CONFIG_APRS
++	// APRS > Mute APRS audio: on the APRS frequency the speaker stays off, the LED and the decoder go on. Monitor
++	// (the squelch held open) still plays it, to listen on purpose
++	if (spk && !sm->view.monitor && fm && sm->view.ch.rx_hz == aprs_mute_hz()) {
++		spk = false;
++	}
++#endif
++	if (sm->audio_out != (int8_t)spk) {
++		sm->audio_out = (int8_t)spk;
++		board.radio->audio(spk);
+ 	}
+ #if CONFIG_DUAL_WATCH
+ 	// The second receiver has the speaker while the selected channel is quiet: that one's calls always win
+diff --git a/core/settings/settings.h b/core/settings/settings.h
+index e5826dc..0f23b99 100644
+--- a/core/settings/settings.h
++++ b/core/settings/settings.h
+@@ -455,6 +455,7 @@ static inline void settings_set_tones_off(settings_t *s, uint8_t off)
+ #define SETTINGS_APRS2_DMR_UDT		0x08u	// digital APRS as an ETSI UDT location (else Motorola LRRP)
+ #define SETTINGS_APRS2_TO_IS		0x10u	// our own beacons to APRS-IS through the host helper
+ #define SETTINGS_APRS2_DMR_GPS		0x20u	// our position in DMR voice calls (ETSI GPS Info LC, CONFIG_DMR_GPS)
++#define SETTINGS_APRS2_MUTE		0x40u	// the speaker stays off on the APRS frequency (decoding goes on)
+ // aprs_misc bit 7: the position service's settings are set (core/position: aprs_lat, aprs_lon, aprs_alt_m,
+ // aprs_pos_src, the ambiguity and SETTINGS_APRS2_DMR_GPS). They are also taken when aprs_stored is 1
+ #define SETTINGS_APRS_MISC_POSITION	0x80u
+diff --git a/core/ui/ui_aprs.c b/core/ui/ui_aprs.c
+index a44e147..fe71376 100644
+--- a/core/ui/ui_aprs.c
++++ b/core/ui/ui_aprs.c
+@@ -38,7 +38,8 @@ WEAK bool ui_svc_aprs_station(uint8_t i, aprs_station_t *out) { (void)i; (void)o
+ WEAK bool ui_svc_aprs_station_find(const char *call, aprs_station_t *out) { (void)call; (void)out; return false; }
+ WEAK bool ui_svc_aprs_range(const aprs_station_t *s, uint32_t *m, uint16_t *deg) { (void)s; (void)m; (void)deg; return false; }
+ 
+-enum { AP_SEND, AP_AUTO, AP_FREQ, AP_POWER, AP_PATH, AP_SSID, AP_INTERVAL, AP_SMART, AP_VIA, AP_KISS, AP_HEARD, AP_COUNT };
++enum { AP_SEND, AP_AUTO, AP_FREQ, AP_POWER, AP_PATH, AP_SSID, AP_INTERVAL, AP_SMART, AP_VIA, AP_KISS, AP_HEARD, AP_MUTE,
++       AP_COUNT };
+ 
+ // The rows this build shows, in order: the packet rows (SSID too) only with the AX.25 backend (CONFIG_APRS_AFSK),
+ // "Send via" only when there is a choice (both backends built)
+@@ -53,7 +54,13 @@ static const uint8_t rows[] = {
+ #endif
+ 	AP_KISS,
+ #if CONFIG_APRS_AFSK
+-	AP_HEARD, AP_SSID,	// set once: last, so the rows above keep their digits
++	AP_HEARD,
++#endif
++#if CONFIG_APRS_RX
++	AP_MUTE,	// after Stations heard: the rows above keep their digits
++#endif
++#if CONFIG_APRS_AFSK
++	AP_SSID,	// set once: last
+ #endif
+ };
+ #define N_ROWS	((uint16_t)(sizeof(rows) / sizeof(rows[0])))
+@@ -162,7 +169,8 @@ static void aprs_item(uint16_t i, ui_item_t *it)
+ 		TRN(LABEL_POWER, "Power"), TRN(APRS_LABEL_PATH, "Path"), TRX(APRS_LABEL_SSID, "SSID"),
+ 		TRN(APRS_LABEL_INTERVAL, "Interval"),
+ 		TRN(APRS_LABEL_SMARTBEACONING, "SmartBeaconing"), TRN(APRS_LABEL_SEND_VIA, "Send via"),
+-		TRN(APRS_LABEL_KISS_ON_USB, "KISS on USB"), TRN(APRS_ROW_STATIONS_HEARD, "Stations heard") };
++		TRN(APRS_LABEL_KISS_ON_USB, "KISS on USB"), TRN(APRS_ROW_STATIONS_HEARD, "Stations heard"),
++		TRN(APRS_LABEL_MUTE, "Mute APRS audio") };
+ 	aprs_view_t v;
+ 	aprs_cfg_t c;
+ 	bool built = ui_svc_aprs_view(&v);
+@@ -223,6 +231,7 @@ static void aprs_item(uint16_t i, ui_item_t *it)
+ 	case AP_SMART: sb_str(&b, c.smart ? TR(VALUE_ON, "On") : TR(VALUE_OFF, "Off")); break;
+ 	case AP_VIA: sb_str(&b, tr(via_names[c.via < APRS_VIA_COUNT ? c.via : 0])); break;
+ 	case AP_KISS: sb_str(&b, c.kiss ? TR(VALUE_ON, "On") : TR(VALUE_OFF, "Off")); break;
++	case AP_MUTE: sb_str(&b, c.mute ? TR(VALUE_ON, "On") : TR(VALUE_OFF, "Off")); break;
+ 	case AP_HEARD:
+ 		if (!CONFIG_APRS_RX) {
+ 			it->flags |= UI_ITEM_DIM;
+@@ -288,6 +297,10 @@ static void aprs_select(uint16_t i, bool hold)
+ 	case AP_SMART: c.smart = !c.smart; break;
+ 	case AP_VIA: c.via = (uint8_t)((c.via + 1u) % APRS_VIA_COUNT); break;
+ 	case AP_KISS: c.kiss = !c.kiss; break;
++	case AP_MUTE:
++		c.mute = !c.mute;
++		ui_toast(c.mute ? TR(APRS_TOAST_MUTED, "APRS audio muted") : TR(APRS_TOAST_UNMUTED, "APRS audio on"));
++		break;
+ 	case AP_HEARD:
+ 		if (!CONFIG_APRS_RX) {
+ 			ui_toast(TR(APRS_WHY_CANT_RECEIVE, "This radio can't receive APRS"));
+diff --git a/docs/user/13-aprs.md b/docs/user/13-aprs.md
+index fcdd0e7..5d08345 100644
+--- a/docs/user/13-aprs.md
++++ b/docs/user/13-aprs.md
+@@ -110,6 +110,9 @@ through a nearby iGate. They appear under the sender's callsign, and the acknowl
+ - On a radio that decodes only what opens the squelch ([Radio reference](23-radios.md)), a packet must be strong enough to open it. Keep the squelch at its usual level, not tight.
+ - Battery saving pauses while the radio listens for APRS: a sleeping receiver misses packets.
+ - Receiving is on by default. Turn it off with `tools/rfoundry_debug.py aprs set rx 0` (FM only).
++- **Mute APRS audio** (last row of the APRS page): the speaker stays off on the APRS frequency, so packets and
++  noise there aren't heard; decoding, Stations heard and the green LED go on. Hold the monitor key to listen anyway.
++  Other channels play as usual.
+ - In [dual watch](12-scan.md#dual-watch) with one channel on the APRS frequency, the radio favors that channel: it
+   listens there three times as long, stays there while a packet comes in (from its first flags, even one too weak to
+   open the squelch, for at most 2.5 s), and after a packet stays about 3 s for a digipeater's copy, with short looks at
+diff --git a/tests/host/aprsRadioTest.c b/tests/host/aprsRadioTest.c
+index c172e78..2cf3895 100644
+--- a/tests/host/aprsRadioTest.c
++++ b/tests/host/aprsRadioTest.c
+@@ -101,7 +101,8 @@ static void r_status(radio_status_t *st)
+ 	st->carrier = false;
+ 	st->tone_ok = true;
+ }
+-static void r_audio(bool on) { (void)on; }
++static bool spk_on;	// the board's FM speaker path (radio_sm.c outputs)
++static void r_audio(bool on) { spk_on = on; }
+ static bool r_tone(uint16_t hz)
+ {
+ 	hw.tone_hz = hz;
+@@ -1782,6 +1783,46 @@ static void test_rx_stream(void)
+ 	CHECK(sm.view.state == RS_IDLE);
+ 	fake_tap.caps = 0;
+ }
++// Mute APRS audio: a signal on the APRS frequency keeps the speaker off (the decoder still listens), Monitor plays it,
++// another channel isn't touched, and the setting is kept
++static void test_mute(void)
++{
++	fake_tap.caps = AUDIO_TAP_FM_RX;
++	memset(&pcm, 0, sizeof(pcm));
++	reset();
++	zone.count = 2;
++	zone.channels[1] = 2;
++	chan.rx_hz = chan.tx_hz = APRS_HZ;
++	settings_init();
++	radio_sm_init(&sm, now);
++	hw.noise_on_aprs = 30;	// a carrier on 144.390
++	run(200);
++	CHECK(spk_on && aprs_rx_listening());	// off by default: plays as before
++	aprs_cfg_t c;
++	aprs_get_cfg(&c);
++	c.mute = true;
++	aprs_set_cfg(&c, now);
++	run(100);
++	CHECK(!spk_on && aprs_rx_listening());
++	req(RREQ_MONITOR, 1);
++	CHECK(spk_on);
++	req(RREQ_MONITOR, 0);
++	run(100);
++	CHECK(!spk_on);
++	aprs_cfg_default(&c);
++	aprs_init(now);	// as at power-up: the setting comes back
++	aprs_get_cfg(&c);
++	CHECK(c.mute);
++	hw.noise_on_aprs = 120;
++	req(RREQ_CH_STEP, 1);	// another channel with the squelch open: plays
++	req(RREQ_MONITOR, 1);
++	CHECK(hw.rx_hz == CH2_HZ && spk_on);
++	req(RREQ_MONITOR, 0);
++	c.mute = false;
++	aprs_set_cfg(&c, now);
++	fake_tap.caps = 0;
++}
++
+ // From a channel on the APRS frequency to another: the receive path lets go of the FM audio before the board is
+ // tuned (a P25 channel's engine needs it to start), not later in the poll
+ static void test_rx_release_on_retune(void)
+@@ -2038,6 +2079,7 @@ int main(void)
+ 	test_stations_digi_igate();
+ 	test_rx_stream();
+ 	test_rx_release_on_retune();
++	test_mute();
+ #if CONFIG_DUAL_WATCH
+ 	test_dual_watch_aprs_rx();
+ #endif
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index 2c8fa92..24a4c1e 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -876,17 +876,17 @@ static const flow_t flows[] = {
+ 	{ "G GPS signal page", "ok 6 2", "3", "shows=9_of_14_in_the_fix", 1, false },
+ 	{ "G GPS grid page", "ok 6 2", "4", "shows=FN42li", 1, false },
+ 	{ "G GPS pages wrap", "ok 6 2", "up down", "shows=Status", 2, false },
+-	{ "A KISS on USB", "ok 6 8", "up up up ok", "aprs_kiss=1", 4, false },
++	{ "A KISS on USB", "ok 6 8", "up up up up ok", "aprs_kiss=1", 5, false },
+ 	// SSID: the last row (set once); OK steps up and wraps, a long OK steps back
+ 	{ "A SSID shows the default", "ok 6 8", "up", "focus=SSID shows=7 aprs_ssid=7", 1, false },
+ 	{ "A SSID: the next one", "ok 6 8 up", "ok ok", "aprs_ssid=9 shows=9", 2, false },
+ 	{ "A SSID: long OK steps back", "ok 6 8 up", "long:ok", "aprs_ssid=6", 1, false },
+ 	{ "A SSID wraps 15 to 0", "ok 6 8 up ok ok ok ok ok ok ok ok", "ok", "aprs_ssid=0", 1, false },
+-	{ "A stations heard", "", "ok 6 8 up up ok", "screen=aprs-heard count=2", 6, false },
+-	{ "A station message survives a newer packet", "ok 6 8 up up ok ok aprs:reorder", "ok",
++	{ "A stations heard", "", "ok 6 8 up up up ok", "screen=aprs-heard count=2", 7, false },
++	{ "A station message survives a newer packet", "ok 6 8 up up up ok ok aprs:reorder", "ok",
+ 	  "screen=compose shows=Q4WABC-15", 1, false },
+-	{ "A station opens its Message action", "ok 6 8 up up ok", "ok", "screen=aprs-station shows=Message", 1, false },
+-	{ "A station Message fills its callsign", "ok 6 8 up up ok ok", "ok", "screen=compose shows=Q4WABC-15", 1, false },
++	{ "A station opens its Message action", "ok 6 8 up up up ok", "ok", "screen=aprs-station shows=Message", 1, false },
++	{ "A station Message fills its callsign", "ok 6 8 up up up ok ok", "ok", "screen=compose shows=Q4WABC-15", 1, false },
+ 	{ "A new APRS message appears independently of DMR format", "", "ok 2", "shows=New_APRS_message", 2, false },
+ 	{ "A new APRS message opens its composer", "ok 2", "ok", "screen=compose shows=To_callsign", 1, false },
+ 	{ "A new APRS message needs our callsign", "aprs:nocall ok 2", "", "hides=New_APRS_message", 0, false },
+@@ -1657,7 +1657,7 @@ static void heard_checks(void)
+ 	for (int g = 0; g < sim_geom_count; g++) {
+ 		for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+ 			sim_reset(&sim_geoms[g], SIM_MAP_K);
+-			snprintf(buf, sizeof buf, "%sok 6 8 up up ok expect:screen=aprs-heard expect:shows=Q4WABC-15 "
++			snprintf(buf, sizeof buf, "%sok 6 8 up up up ok expect:screen=aprs-heard expect:shows=Q4WABC-15 "
+ 				 "expect:shows=QJ4XYZ expect:%s=14.5_km_NE", cases[i].setup,
+ 				 cases[i].range ? "shows" : "hides");
+ 			if (!sim_run(buf, err, sizeof err)) {
+@@ -1669,7 +1669,7 @@ static void heard_checks(void)
+ 	// Packets without a position since the last one: the row's age is the position's (10 min), not the last
+ 	// packet's (1 min), so it says how old the range is
+ 	sim_reset(&sim_geoms[0], SIM_MAP_K);
+-	if (!sim_run("wait:600000 ok 6 8 up up ok expect:shows=14.5_km_NE expect:shows=10m expect:hides=1m", err,
++	if (!sim_run("wait:600000 ok 6 8 up up up ok expect:shows=14.5_km_NE expect:shows=10m expect:hides=1m", err,
+ 		     sizeof err)) {
+ 		printf("FAIL stations heard position age [%s]: %s\n", sim_geoms[0].name, err);
+ 		fails++;
+@@ -1677,7 +1677,7 @@ static void heard_checks(void)
+ 	// BVA on the row's width: a display too narrow for the call, the range and the age gives up the range, never
+ 	// the call (96 px: under 20 cells, the call and the range alone are 20)
+ 	sim_reset(sim_geom_find("96x64m"), SIM_MAP_K);
+-	if (!sim_run("ok 6 8 up up ok expect:screen=aprs-heard expect:shows=Q4WABC-15 expect:hides=km", err, sizeof err)) {
++	if (!sim_run("ok 6 8 up up up ok expect:screen=aprs-heard expect:shows=Q4WABC-15 expect:hides=km", err, sizeof err)) {
+ 		printf("FAIL stations heard narrow [96x64m]: %s\n", err);
+ 		fails++;
+ 	}
+@@ -1687,33 +1687,33 @@ static void heard_checks(void)
+ static void station_checks(void)
+ {
+ 	static const struct { const char *name, *script; } cases[] = {
+-		{ "position", "wait:600000 ok 6 8 up up ok ok expect:screen=aprs-station expect:count=10 "
++		{ "position", "wait:600000 ok 6 8 up up up ok ok expect:screen=aprs-station expect:count=10 "
+ 		  "down expect:shows=14.5_km_NE down expect:shows=1m down expect:shows=Direct "
+ 		  "down expect:shows=10m down expect:shows=19_km/h down expect:shows=40 "
+ 		  "down expect:shows=/> down expect:shows=On_the_road down expect:focus=Packets expect:shows=3 "
+ 		  "ok expect:screen=aprs-station" },
+-		{ "no local position", "aprs:nopos ok 6 8 up up ok ok expect:count=8 down expect:shows=Heard" },
+-		{ "no speed", "aprs:nospeed ok 6 8 up up ok ok expect:count=7 down down down down expect:shows=/>" },
+-		{ "no station position", "ok 6 8 up up ok down ok expect:count=5 down down "
++		{ "no local position", "aprs:nopos ok 6 8 up up up ok ok expect:count=8 down expect:shows=Heard" },
++		{ "no speed", "aprs:nospeed ok 6 8 up up up ok ok expect:count=7 down down down down expect:shows=/>" },
++		{ "no station position", "ok 6 8 up up up ok down ok expect:count=5 down down "
+ 		  "expect:shows=Via_digipeater down expect:shows=At_home down expect:shows=Packets" },
+-		{ "speed unknown", "aprs:speedunknown ok 6 8 up up ok ok expect:count=8 "
++		{ "speed unknown", "aprs:speedunknown ok 6 8 up up up ok ok expect:count=8 "
+ 		  "down down down down expect:focus=Course expect:shows=40 expect:hides=Speed" },
+-		{ "course unknown", "aprs:courseunknown ok 6 8 up up ok ok expect:count=8 "
++		{ "course unknown", "aprs:courseunknown ok 6 8 up up up ok ok expect:count=8 "
+ 		  "down down down down expect:focus=Speed expect:shows=19_km/h down expect:focus=Symbol" },
+-		{ "known zero motion", "aprs:zero ok 6 8 up up ok ok expect:count=9 "
++		{ "known zero motion", "aprs:zero ok 6 8 up up up ok ok expect:count=9 "
+ 		  "down down down down expect:focus=Speed expect:shows=0_km/h down expect:focus=Course expect:shows=0" },
+-		{ "equal ages", "wait:600000 aprs:sameage ok 6 8 up up ok ok expect:count=9 "
++		{ "equal ages", "wait:600000 aprs:sameage ok 6 8 up up up ok ok expect:count=9 "
+ 		  "down down expect:focus=Heard expect:shows=1m down expect:focus=Direct down expect:focus=Speed" },
+-		{ "position lost while open", "wait:600000 ok 6 8 up up ok ok aprs:stationnopos down "
++		{ "position lost while open", "wait:600000 ok 6 8 up up up ok ok aprs:stationnopos down "
+ 		  "expect:count=6 expect:shows=Q4WABC-15 expect:focus=Heard expect:hides=km "
+ 		  "down expect:focus=Direct down expect:focus=Symbol" },
+-		{ "empty text and symbol", "aprs:emptytext ok 6 8 up up ok ok expect:count=7 "
++		{ "empty text and symbol", "aprs:emptytext ok 6 8 up up up ok ok expect:count=7 "
+ 		  "up expect:focus=Packets up expect:focus=Course" },
+-		{ "retained text", "aprs:longtext ok 6 8 up up ok ok up up "
++		{ "retained text", "aprs:longtext ok 6 8 up up up ok ok up up "
+ 		  "expect:focus=12345678901234567890123" },
+-		{ "reordered detail", "ok 6 8 up up ok ok aprs:reorder down expect:count=9 "
++		{ "reordered detail", "ok 6 8 up up up ok ok aprs:reorder down expect:count=9 "
+ 		  "expect:shows=Q4WABC-15 expect:shows=14.5_km_NE up ok expect:screen=compose expect:shows=Q4WABC-15" },
+-		{ "evicted", "ok 6 8 up up ok ok aprs:evict down expect:count=2 expect:shows=No_longer_in_list "
++		{ "evicted", "ok 6 8 up up up ok ok aprs:evict down expect:count=2 expect:shows=No_longer_in_list "
+ 		  "up ok expect:screen=compose expect:shows=Q4WABC-15" },
+ 	};
+ 	char err[300];
