@@ -29,6 +29,7 @@ PATCHES = (
 	'aprs-dual-focus.patch',
 	'dual-back-ab.patch',	# dual watch: Back switches A/B, held Back stops
 	'aprs-rx-release.patch',	# APRS lets go of FM audio before a retune: P25 engine start (NO TX)
+	'p25-audio-fifo.patch',	# RadioFoundry 845f9ad5 (#660): HR_C7000 speaker FIFO starvation, P25 clipping
 )
 
 
