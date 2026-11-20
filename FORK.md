@@ -22,6 +22,8 @@ dropped once (`9a0e33e`) on suspicion of a P25 "NO TX" fault that turned out to 
 `aprs-rx-release.patch`, and restored after that fix. Drop it once upstream moves its RadioFoundry pin past
 `845f9ad5`.
 
+On the radio: P25 receive sounded good on simplex (talkaround from a Motorola XTS2500), 2026-11-20.
+
 ## Updating
 
 **Sync fork** on GitHub, then check the build. If upstream moves its RadioFoundry pin past `845f9ad5`, remove
